@@ -10,6 +10,13 @@ Run the main script:
 python ss.py
 ```
 
+Or make it executable and run directly:
+
+```bash
+chmod +x ss.py
+./ss.py
+```
+
 ## Features
 
 - SS: Simple Script implementation
