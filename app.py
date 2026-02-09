@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 import time
 from functools import wraps
+import traceback
 
 import psycopg2
 import psycopg2.extras
@@ -76,13 +77,75 @@ def return_db_connection(conn):
     conn.close()
 
 
+def init_db():
+    """Initialize database tables if they don't exist"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # Licenses Table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS licenses (
+                    id SERIAL PRIMARY KEY,
+                    license_key VARCHAR(50) UNIQUE NOT NULL,
+                    hwid VARCHAR(100) DEFAULT NULL,
+                    expiry_date TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used TIMESTAMP DEFAULT NULL,
+                    status VARCHAR(20) DEFAULT 'active',
+                    notes TEXT DEFAULT NULL,
+                    key_type VARCHAR(20) DEFAULT 'standard'
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_license_key ON licenses(license_key);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_hwid ON licenses(hwid);")
+
+            # Server Settings
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS server_settings (
+                    id SERIAL PRIMARY KEY,
+                    key VARCHAR(100) UNIQUE NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # Default Settings
+            cur.execute("""
+                INSERT INTO server_settings (key, value) VALUES 
+                    ('server_enabled', '1'),
+                    ('key_validation_enabled', '1'),
+                    ('key_creation_enabled', '1')
+                ON CONFLICT (key) DO NOTHING;
+            """)
+            
+        print("✅ Database initialized successfully.")
+    except Exception as e:
+        print(f"❌ Database initialization failed: {e}")
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# Initialize DB on startup
+init_db()
+
+
 def get_status(conn, key):
-    with conn.cursor() as cur:
-        cur.execute("SELECT value FROM server_settings WHERE key = %s LIMIT 1", (key,))
-        row = cur.fetchone()
-    if not row:
-        return True
-    return str(row[0]) == "1"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM server_settings WHERE key = %s LIMIT 1", (key,))
+            row = cur.fetchone()
+        if not row:
+            return True
+        # Handle both tuple (default) and dict (if factory persisted)
+        if isinstance(row, dict):
+            return str(row.get('value')) == "1"
+        if isinstance(row, (list, tuple)):
+            return str(row[0]) == "1" if len(row) > 0 else True
+        return str(row) == "1"
+    except Exception as e:
+        print(f"[WARN] get_status failed for {key}: {e}")
+        return True  # Default to open if check fails
 
 
 @app.before_request
@@ -95,6 +158,8 @@ def check_server_enabled():
         conn = get_db_connection()
         if not get_status(conn, "server_enabled"):
             return jsonify({"error": "Server temporarily disabled by admin"}), 503
+    except Exception as e:
+        print(f"[WARN] Server check failed: {e}")
     finally:
         if conn:
             return_db_connection(conn)
@@ -172,7 +237,8 @@ def validate_key():
         )
     except Exception as e:
         print(f"[ERROR] Validation failed: {str(e)}")
-        return jsonify({"valid": False, "message": "Server error"}), 500
+        print(traceback.format_exc())
+        return jsonify({"valid": False, "message": f"Server error: {str(e)}"}), 500
     finally:
         if conn:
             return_db_connection(conn)
