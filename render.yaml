@@ -1,0 +1,3 @@
+# Render Deployment Configuration
+buildCommand: chmod +x render-build.sh && ./render-build.sh
+startCommand: gunicorn app:app
