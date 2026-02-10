@@ -1,370 +1,504 @@
-#!/usr/bin/env python3
-"""
-ST FAMILY - Bypass Offset Distribution Bot
-Telegram bot for managing and distributing OB52 bypass offsets
-"""
-
 import os
+import re
 import json
-import sqlite3
-import hashlib
-from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from cryptography.fernet import Fernet
+import random
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
+import time
+from functools import wraps
 
-# Configuration
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '8216359066:AAEt2GFGgTBp3hh_znnJagH3h1nN5A_XQf0')
-ADMIN_IDS = [7210704553]  # Admin Telegram user ID
-DB_PATH = 'bypass_server.db'
-OFFSETS_FILE = 'ob52_offsets.json'
-ENCRYPTION_KEY = Fernet.generate_key()  # Generate once and save
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
+import requests
+from flask import Flask, request, jsonify
 
-# Initialize encryption
-cipher = Fernet(ENCRYPTION_KEY)
+app = Flask(__name__)
 
-# Database initialization
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # License keys table
-    c.execute('''CREATE TABLE IF NOT EXISTS license_keys (
-        key TEXT PRIMARY KEY,
-        created_at TEXT,
-        expires_at TEXT,
-        device_id TEXT,
-        status TEXT,
-        last_used TEXT,
-        request_count INTEGER DEFAULT 0
-    )''')
-    
-    # Offsets history table
-    c.execute('''CREATE TABLE IF NOT EXISTS offset_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        version TEXT,
-        offsets TEXT,
-        uploaded_by INTEGER,
-        uploaded_at TEXT,
-        status TEXT
-    )''')
-    
-    # Access logs
-    c.execute('''CREATE TABLE IF NOT EXISTS access_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        license_key TEXT,
-        device_id TEXT,
-        ip_address TEXT,
-        timestamp TEXT,
-        action TEXT
-    )''')
-    
-    conn.commit()
-    conn.close()
+# Connection pool to prevent blocking
+db_pool = None
 
-# License key generation
-def generate_license_key(days=30):
-    """Generate a unique license key"""
-    timestamp = str(datetime.now().timestamp())
-    random_str = os.urandom(16).hex()
-    key = hashlib.sha256(f"{timestamp}{random_str}".encode()).hexdigest()[:16].upper()
-    formatted_key = f"ST-{key[:4]}-{key[4:8]}-{key[8:12]}-{key[12:16]}"
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    created = datetime.now().isoformat()
-    expires = datetime.fromtimestamp(datetime.now().timestamp() + (days * 86400)).isoformat()
-    c.execute('INSERT INTO license_keys VALUES (?, ?, ?, ?, ?, ?, ?)',
-              (formatted_key, created, expires, None, 'active', None, 0))
-    conn.commit()
-    conn.close()
-    
-    return formatted_key
+DEFAULT_DB_URL = (
+    "postgresql://dylip_key_user:TwbqpTuAggFaAXhIX7Q7pMmJIih5vEQe@"
+    "dpg-d5v88bl6ubrc73c8tlqg-a.oregon-postgres.render.com/dylip_key"
+)
 
-# Load current offsets
-def load_offsets():
-    """Load offsets from JSON file"""
+DB_URL = os.getenv("DATABASE_URL", os.getenv("POSTGRES_URL", DEFAULT_DB_URL))
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    "8216359066:AAEt2GFGgTBp3hh_znnJagH3h1nN5A_XQf0",
+)
+TELEGRAM_ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "7210704553"))
+
+KEY_REGEX = re.compile(r"^[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}$", re.I)
+GLOBAL_KEY_REGEX = re.compile(r"^GLB-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}$", re.I)
+
+
+def get_db_connection():
+    global db_pool
+    if db_pool is None:
+        try:
+            db_pool = psycopg2.pool.SimpleConnectionPool(
+                1, 10,  # min=1, max=10 connections
+                DB_URL,
+                sslmode='require',
+                connect_timeout=5
+            )
+        except psycopg2.OperationalError:
+            db_pool = psycopg2.pool.SimpleConnectionPool(
+                1, 10,
+                DB_URL,
+                connect_timeout=5
+            )
+    
     try:
-        with open(OFFSETS_FILE, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {
-            "version": "OB52",
-            "last_update": datetime.now().isoformat(),
-            "offsets": {
-                "BAN_CHECK_1": "0x671CB8C",
-                "BAN_CHECK_2": "0x0",
-                "BAN_REPORT": "0x0",
-                "DETECT_CHEAT_1": "0x0",
-                "DETECT_CHEAT_2": "0x0",
-                "DETECT_MEMORY": "0x0",
-                "REPORT_PLAYER": "0x0",
-                "REPORT_SEND": "0x0",
-                "SECURITY_CHECK_1": "0x671CB8C",
-                "SECURITY_CHECK_2": "0x0"
+        conn = db_pool.getconn()
+        conn.autocommit = True
+        return conn
+    except:
+        # Fallback to direct connection
+        try:
+            conn = psycopg2.connect(DB_URL, sslmode='require', connect_timeout=5)
+        except psycopg2.OperationalError:
+            conn = psycopg2.connect(DB_URL, connect_timeout=5)
+        conn.autocommit = True
+        return conn
+
+def return_db_connection(conn):
+    """Return connection to pool"""
+    global db_pool
+    if db_pool:
+        try:
+            db_pool.putconn(conn)
+            return
+        except:
+            pass
+    conn.close()
+
+
+def get_status(conn, key):
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM server_settings WHERE key = %s LIMIT 1", (key,))
+        row = cur.fetchone()
+    if not row:
+        return True
+    return str(row[0]) == "1"
+
+
+@app.before_request
+def check_server_enabled():
+    path = request.path
+    if path in ("/health", "/telegram-webhook"):
+        return None
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not get_status(conn, "server_enabled"):
+            return jsonify({"error": "Server temporarily disabled by admin"}), 503
+    finally:
+        if conn:
+            return_db_connection(conn)
+    return None
+
+
+@app.get("/")
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "service": "ST FAMILY License Server"})
+
+
+@app.post("/validate")
+def validate_key():
+    start_time = time.time()
+    payload = request.get_json(silent=True) or {}
+    key = payload.get("key", "").strip()
+    hwid = payload.get("hwid", "").strip()
+
+    if not key or not hwid:
+        return jsonify({"valid": False, "message": "Invalid request: Missing key or HWID"})
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not get_status(conn, "key_validation_enabled"):
+            return jsonify({"valid": False, "message": "Key validation temporarily disabled"})
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT * FROM licenses
+                WHERE license_key = %s
+                  AND expiry_date > NOW()
+                  AND status = 'active'
+                  AND (
+                    key_type LIKE 'global_%'
+                    OR hwid = %s
+                    OR hwid IS NULL
+                    OR hwid = ''
+                  )
+                LIMIT 1
+                """,
+                (key, hwid),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return jsonify({"valid": False, "message": "Invalid key or already bound to another device"})
+
+        is_global = str(row.get("key_type", ""))
+        is_global = is_global.startswith("global_")
+
+        with conn.cursor() as cur:
+            if not is_global and not row.get("hwid"):
+                cur.execute(
+                    "UPDATE licenses SET hwid = %s, last_used = NOW() WHERE license_key = %s",
+                    (hwid, key),
+                )
+            else:
+                cur.execute(
+                    "UPDATE licenses SET last_used = NOW() WHERE license_key = %s",
+                    (key,),
+                )
+
+        elapsed = time.time() - start_time
+        print(f"[VALIDATE] Key validated in {elapsed:.2f}s")
+        
+        return jsonify(
+            {
+                "valid": True,
+                "message": "Key activated successfully!",
+                "expiry_date": row.get("expiry_date"),
             }
-        }
-
-# Save offsets
-def save_offsets(offsets_data, admin_id):
-    """Save offsets to file and log to database"""
-    with open(OFFSETS_FILE, 'w') as f:
-        json.dump(offsets_data, f, indent=2)
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO offset_history VALUES (?, ?, ?, ?, ?, ?)',
-              (None, offsets_data['version'], json.dumps(offsets_data['offsets']),
-               admin_id, datetime.now().isoformat(), 'active'))
-    conn.commit()
-    conn.close()
-
-# Encrypt offsets for distribution
-def encrypt_offsets(offsets_data):
-    """Encrypt offsets for secure distribution"""
-    offsets_json = json.dumps(offsets_data)
-    encrypted = cipher.encrypt(offsets_json.encode())
-    return encrypted.hex()
-
-# Bot command handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Access denied. Admin only.")
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton("📊 Server Status", callback_data='status')],
-        [InlineKeyboardButton("🔑 Generate Key", callback_data='generate_key')],
-        [InlineKeyboardButton("📝 View Keys", callback_data='view_keys')],
-        [InlineKeyboardButton("⚙️ Manage Offsets", callback_data='manage_offsets')],
-        [InlineKeyboardButton("📈 Statistics", callback_data='stats')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "🎮 *ST FAMILY Bypass Server*\n\n"
-        "Admin Control Panel\n"
-        "Select an option:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show server status"""
-    query = update.callback_query
-    await query.answer()
-    
-    offsets = load_offsets()
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM license_keys WHERE status="active"')
-    active_keys = c.fetchone()[0]
-    c.execute('SELECT COUNT(*) FROM access_logs WHERE date(timestamp) = date("now")')
-    today_requests = c.fetchone()[0]
-    conn.close()
-    
-    # Count valid offsets
-    valid_offsets = sum(1 for v in offsets['offsets'].values() if v != "0x0")
-    total_offsets = len(offsets['offsets'])
-    
-    status_text = (
-        f"📊 *Server Status*\n\n"
-        f"🔐 Active Keys: {active_keys}\n"
-        f"📡 Today's Requests: {today_requests}\n"
-        f"🎯 Offset Version: {offsets['version']}\n"
-        f"✅ Valid Offsets: {valid_offsets}/{total_offsets}\n"
-        f"📅 Last Update: {offsets['last_update'][:10]}\n"
-        f"🟢 Status: Online"
-    )
-    
-    await query.edit_message_text(status_text, parse_mode='Markdown')
-
-async def generate_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate new license key"""
-    query = update.callback_query
-    await query.answer()
-    
-    key = generate_license_key(days=30)
-    
-    await query.edit_message_text(
-        f"🔑 *New License Key Generated*\n\n"
-        f"`{key}`\n\n"
-        f"✅ Valid for: 30 days\n"
-        f"📋 Copy and share with user",
-        parse_mode='Markdown'
-    )
-
-async def view_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """View all license keys"""
-    query = update.callback_query
-    await query.answer()
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT key, status, expires_at, request_count FROM license_keys ORDER BY created_at DESC LIMIT 10')
-    keys = c.fetchall()
-    conn.close()
-    
-    if not keys:
-        await query.edit_message_text("No license keys found.")
-        return
-    
-    text = "🔑 *Recent License Keys*\n\n"
-    for key, status, expires, count in keys:
-        status_emoji = "✅" if status == "active" else "❌"
-        text += f"{status_emoji} `{key}`\n"
-        text += f"   Expires: {expires[:10]} | Uses: {count}\n\n"
-    
-    await query.edit_message_text(text, parse_mode='Markdown')
-
-async def manage_offsets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show offset management menu"""
-    query = update.callback_query
-    await query.answer()
-    
-    offsets = load_offsets()
-    
-    text = "⚙️ *Current Offsets*\n\n"
-    for name, value in offsets['offsets'].items():
-        status = "✅" if value != "0x0" else "⚠️"
-        text += f"{status} `{name}`: `{value}`\n"
-    
-    text += f"\n📝 Version: {offsets['version']}\n"
-    text += f"🔄 Last Update: {offsets['last_update'][:19]}\n\n"
-    text += "Use /setoffset <name> <value> to update"
-    
-    await query.edit_message_text(text, parse_mode='Markdown')
-
-async def set_offset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set a specific offset value"""
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Access denied.")
-        return
-    
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: /setoffset <name> <value>\n"
-            "Example: /setoffset BAN_CHECK_1 0x1234567"
         )
-        return
-    
-    offset_name = context.args[0].upper()
-    offset_value = context.args[1]
-    
-    # Validate hex format
-    if not offset_value.startswith('0x'):
-        await update.message.reply_text("❌ Value must start with 0x")
-        return
-    
-    offsets = load_offsets()
-    
-    if offset_name not in offsets['offsets']:
-        await update.message.reply_text(f"❌ Unknown offset: {offset_name}")
-        return
-    
-    offsets['offsets'][offset_name] = offset_value
-    offsets['last_update'] = datetime.now().isoformat()
-    save_offsets(offsets, user_id)
-    
-    await update.message.reply_text(
-        f"✅ Updated!\n"
-        f"`{offset_name}` = `{offset_value}`",
-        parse_mode='Markdown'
-    )
+    except Exception as e:
+        print(f"[ERROR] Validation failed: {str(e)}")
+        return jsonify({"valid": False, "message": "Server error"}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
 
-async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show detailed statistics"""
-    query = update.callback_query
-    await query.answer()
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Total keys
-    c.execute('SELECT COUNT(*) FROM license_keys')
-    total_keys = c.fetchone()[0]
-    
-    # Active keys
-    c.execute('SELECT COUNT(*) FROM license_keys WHERE status="active"')
-    active_keys = c.fetchone()[0]
-    
-    # Total requests
-    c.execute('SELECT COUNT(*) FROM access_logs')
-    total_requests = c.fetchone()[0]
-    
-    # Today's requests
-    c.execute('SELECT COUNT(*) FROM access_logs WHERE date(timestamp) = date("now")')
-    today_requests = c.fetchone()[0]
-    
-    # Most active key
-    c.execute('SELECT key, request_count FROM license_keys ORDER BY request_count DESC LIMIT 1')
-    top_key = c.fetchone()
-    
-    conn.close()
-    
-    text = (
-        f"📈 *Detailed Statistics*\n\n"
-        f"🔑 Total Keys: {total_keys}\n"
-        f"✅ Active Keys: {active_keys}\n"
-        f"❌ Inactive Keys: {total_keys - active_keys}\n\n"
-        f"📡 Total Requests: {total_requests}\n"
-        f"📅 Today's Requests: {today_requests}\n\n"
-    )
-    
-    if top_key:
-        text += f"🏆 Most Active Key:\n`{top_key[0]}` ({top_key[1]} uses)"
-    
-    await query.edit_message_text(text, parse_mode='Markdown')
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button callbacks"""
-    query = update.callback_query
-    
-    handlers = {
-        'status': status,
-        'generate_key': generate_key_callback,
-        'view_keys': view_keys,
-        'manage_offsets': manage_offsets,
-        'stats': get_stats
+@app.get("/generate")
+def generate_api():
+    count = max(1, int(request.args.get("count", 1)))
+    days = max(1, int(request.args.get("days", 30)))
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not get_status(conn, "key_creation_enabled"):
+            return jsonify({"success": False, "message": "Key creation disabled"}), 403
+
+        keys = []
+        expiry = datetime.now(timezone.utc) + timedelta(days=days)
+        with conn.cursor() as cur:
+            for _ in range(count):
+                key = "{:04X}-{:04X}-{:04X}-{:04X}".format(
+                    random.randint(0, 0xFFFF),
+                    random.randint(0, 0xFFFF),
+                    random.randint(0, 0xFFFF),
+                    random.randint(0, 0xFFFF),
+                )
+                cur.execute(
+                    "INSERT INTO licenses (license_key, expiry_date, key_type) VALUES (%s, %s, %s)",
+                    (key, expiry, "standard"),
+                )
+                keys.append({"key": key, "expiry_date": expiry.isoformat()})
+
+        return jsonify({"success": True, "message": f"{len(keys)} keys generated", "keys": keys})
+    except Exception as e:
+        print(f"[ERROR] Generate failed: {str(e)}")
+        return jsonify({"success": False, "message": "Server error"}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+
+@app.post("/telegram-webhook")
+def telegram_webhook():
+    update = request.get_json(silent=True) or {}
+    if not update:
+        return "", 200
+
+    message = update.get("message")
+    callback_query = update.get("callback_query")
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        if callback_query:
+            chat_id = callback_query["message"]["chat"]["id"]
+            data = callback_query.get("data", "")
+
+            if data.startswith("gen_"):
+                _, count, days = data.split("_")
+                generate_keys(chat_id, int(count), int(days), "standard", conn)
+            elif data.startswith("global_"):
+                _, key_type = data.split("_")
+                generate_global_key(chat_id, key_type, conn)
+            elif data == "server_toggle":
+                toggle_status(chat_id, "server_enabled", "Server", conn)
+            elif data == "validation_toggle":
+                toggle_status(chat_id, "key_validation_enabled", "Validation", conn)
+            elif data == "creation_toggle":
+                toggle_status(chat_id, "key_creation_enabled", "Creation", conn)
+            elif data == "delete_expired":
+                delete_expired(chat_id, conn)
+
+            answer_callback_query(callback_query["id"])
+            return "", 200
+
+        if message:
+            chat_id = message["chat"]["id"]
+            text = (message.get("text") or "").strip()
+            user_id = message["from"]["id"]
+
+            if user_id != TELEGRAM_ADMIN_ID:
+                send_message(chat_id, "⛔ Unauthorized")
+                return "", 200
+
+            if text == "/start":
+                send_main_menu(chat_id)
+            elif text == "/generate":
+                send_generate_menu(chat_id)
+            elif text == "/global":
+                send_global_menu(chat_id)
+            elif text == "/control":
+                send_control_menu(chat_id, conn)
+            elif text == "/stats":
+                send_stats(chat_id, conn)
+            elif text == "/list":
+                list_active_keys(chat_id, conn)
+            elif KEY_REGEX.match(text) or GLOBAL_KEY_REGEX.match(text):
+                lookup_key(chat_id, text, conn)
+
+        return "", 200
+    except Exception as e:
+        print(f"[ERROR] Webhook failed: {str(e)}")
+        return "", 200
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+
+# Telegram helpers
+
+def send_message(chat_id, text, reply_markup=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    requests.post(url, data=data, timeout=10)
+
+
+def answer_callback_query(callback_id):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+    requests.post(url, data={"callback_query_id": callback_id}, timeout=10)
+
+
+def send_main_menu(chat_id):
+    text = "🎮 <b>ST FAMILY License Bot</b>\n\n"
+    text += "/generate - Standard keys\n"
+    text += "/global - Global keys (unlimited users)\n"
+    text += "/control - Server controls\n"
+    text += "/stats - Statistics\n"
+    text += "/list - List keys"
+    send_message(chat_id, text)
+
+
+def send_generate_menu(chat_id):
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "1 Key - 7 Days", "callback_data": "gen_1_7"},
+                {"text": "1 Key - 30 Days", "callback_data": "gen_1_30"},
+            ],
+            [
+                {"text": "5 Keys - 30 Days", "callback_data": "gen_5_30"},
+                {"text": "10 Keys - 30 Days", "callback_data": "gen_10_30"},
+            ],
+            [
+                {"text": "1 Key - Lifetime", "callback_data": "gen_1_3650"},
+                {"text": "5 Keys - Lifetime", "callback_data": "gen_5_3650"},
+            ],
+        ]
     }
-    
-    handler = handlers.get(query.data)
-    if handler:
-        await handler(update, context)
+    send_message(chat_id, "🔑 Generate Standard Keys", keyboard)
 
-def main():
-    """Start the bot"""
-    print("🚀 Initializing ST FAMILY Bypass Server Bot...")
-    
-    # Initialize database
-    init_db()
-    print("✅ Database initialized")
-    
-    # Create default offsets file if not exists
-    if not os.path.exists(OFFSETS_FILE):
-        save_offsets(load_offsets(), 0)
-        print("✅ Default offsets created")
-    
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Register handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("setoffset", set_offset))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    
-    print("✅ Bot is running...")
-    print(f"📋 Encryption key: {ENCRYPTION_KEY.decode()}")
-    print("⚠️  Save this key for the API server!")
-    
-    # Start the bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == '__main__':
-    main()
+def send_global_menu(chat_id):
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "🌍 Global Day", "callback_data": "global_day"}],
+            [{"text": "🌍 Global Week", "callback_data": "global_week"}],
+            [{"text": "🌍 Global Month", "callback_data": "global_month"}],
+        ]
+    }
+    send_message(chat_id, "🌐 Global Keys (Unlimited Users)", keyboard)
+
+
+def send_control_menu(chat_id, conn):
+    server = get_status(conn, "server_enabled")
+    validation = get_status(conn, "key_validation_enabled")
+    creation = get_status(conn, "key_creation_enabled")
+
+    text = "⚙️ <b>Control Panel</b>\n\n"
+    text += ("🟢" if server else "🔴") + " Server\n"
+    text += ("🟢" if validation else "🔴") + " Validation\n"
+    text += ("🟢" if creation else "🔴") + " Creation"
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "🔴 Stop Server" if server else "🟢 Start Server",
+                    "callback_data": "server_toggle",
+                }
+            ],
+            [
+                {
+                    "text": "🔴 Disable Validation" if validation else "🟢 Enable Validation",
+                    "callback_data": "validation_toggle",
+                }
+            ],
+            [
+                {
+                    "text": "🔴 Disable Creation" if creation else "🟢 Enable Creation",
+                    "callback_data": "creation_toggle",
+                }
+            ],
+            [{"text": "🗑️ Delete Expired", "callback_data": "delete_expired"}],
+        ]
+    }
+    send_message(chat_id, text, keyboard)
+
+
+def generate_keys(chat_id, count, days, key_type, conn):
+    if not get_status(conn, "key_creation_enabled"):
+        send_message(chat_id, "❌ Creation disabled")
+        return
+
+    keys = []
+    expiry = datetime.now(timezone.utc) + timedelta(days=days)
+    with conn.cursor() as cur:
+        for _ in range(count):
+            key = "{:04X}-{:04X}-{:04X}-{:04X}".format(
+                random.randint(0, 0xFFFF),
+                random.randint(0, 0xFFFF),
+                random.randint(0, 0xFFFF),
+                random.randint(0, 0xFFFF),
+            )
+            cur.execute(
+                "INSERT INTO licenses (license_key, expiry_date, key_type) VALUES (%s, %s, %s)",
+                (key, expiry, key_type),
+            )
+            keys.append(key)
+
+    duration = "Lifetime" if days >= 3650 else f"{days} Days"
+    text = f"✅ Generated {count} Key(s) - {duration}\n\n<code>" + "\n".join(keys) + "</code>"
+    send_message(chat_id, text)
+
+
+def generate_global_key(chat_id, key_type, conn):
+    if not get_status(conn, "key_creation_enabled"):
+        send_message(chat_id, "❌ Creation disabled")
+        return
+
+    days = {"day": 1, "week": 7, "month": 30}.get(key_type, 1)
+    key = "GLB-{:04X}-{:04X}-{:04X}".format(
+        random.randint(0, 0xFFFF),
+        random.randint(0, 0xFFFF),
+        random.randint(0, 0xFFFF),
+    )
+    expiry = datetime.now(timezone.utc) + timedelta(days=days)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO licenses (license_key, expiry_date, key_type) VALUES (%s, %s, %s)",
+            (key, expiry, f"global_{key_type}"),
+        )
+
+    text = (
+        f"🌐 Global {key_type} Key\n\n<code>{key}</code>\n\n✅ Unlimited users\n⏰ {days} day(s)"
+    )
+    send_message(chat_id, text)
+
+
+def toggle_status(chat_id, key, name, conn):
+    current = get_status(conn, key)
+    new_value = "0" if current else "1"
+    with conn.cursor() as cur:
+        cur.execute("UPDATE server_settings SET value = %s WHERE key = %s", (new_value, key))
+    state = "enabled" if new_value == "1" else "disabled"
+    send_message(chat_id, ("🟢" if new_value == "1" else "🔴") + f" {name} {state}")
+
+
+def delete_expired(chat_id, conn):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM licenses WHERE expiry_date < NOW()")
+        deleted = cur.rowcount
+    send_message(chat_id, f"🗑️ Deleted {deleted} expired keys")
+
+
+def send_stats(chat_id, conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM licenses")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM licenses WHERE status = 'active' AND expiry_date > NOW()")
+        active = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM licenses WHERE hwid IS NOT NULL")
+        used = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM licenses WHERE key_type LIKE 'global_%'")
+        global_keys = cur.fetchone()[0]
+
+    text = (
+        "📊 <b>Statistics</b>\n\n"
+        f"📦 Total: {total}\n"
+        f"✅ Active: {active}\n"
+        f"🔗 Used: {used}\n"
+        f"🌐 Global: {global_keys}"
+    )
+    send_message(chat_id, text)
+
+
+def list_active_keys(chat_id, conn):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT license_key, hwid, expiry_date, key_type
+            FROM licenses
+            WHERE status = 'active' AND expiry_date > NOW()
+            ORDER BY created_at DESC
+            LIMIT 20
+            """
+        )
+        rows = cur.fetchall()
+
+    text = "🔑 Active Keys (Last 20)\n\n"
+    for row in rows:
+        is_global = str(row.get("key_type", "")).startswith("global_")
+        status = "🌐 Global" if is_global else ("🔗 Bound" if row.get("hwid") else "⚪ Available")
+        text += f"<code>{row['license_key']}</code> {status}\n"
+
+    send_message(chat_id, text)
+
+
+def lookup_key(chat_id, key, conn):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM licenses WHERE license_key = %s", (key,))
+        row = cur.fetchone()
+
+    if not row:
+        send_message(chat_id, "❌ Key not found")
+        return
+
+    is_global = str(row.get("key_type", "")).startswith("global_")
+    text = f"🔍 Key: <code>{key}</code>\n"
+    text += "Type: " + ("🌐 Global" if is_global else "Standard") + "\n"
+    text += "Status: " + ("✅" if row.get("status") == "active" else "❌") + f" {row.get('status')}\n"
+    text += "Expires: " + row.get("expiry_date").strftime("%Y-%m-%d %H:%M")
+    send_message(chat_id, text)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
