@@ -1,397 +1,347 @@
 import os
-import telebot
+import time
+import secrets
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
 
-# Configuration
-BOT_TOKEN = "8216359066:AAEt2GFGgTBp3hh_znnJagH3h1nN5A_XQf0"
-DB_URL = "postgresql://key_dyli_p_new_user:ZzG0MiuxZ4TN04IP22Ae7g750eCgLxAp@dpg-d658hpe3jp1c73ajnb3g-a.oregon-postgres.render.com/key_dyli_p_new"
-ADMIN_IDS = [7210704553]  # Your admin ID
+app = Flask(__name__)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# Database configuration
+DB_URL = os.getenv("DATABASE_URL", "postgresql://key_dyli_p_new_user:ZzG0MiuxZ4TN04IP22Ae7g750eCgLxAp@dpg-d658hpe3jp1c73ajnb3g-a.oregon-postgres.render.com/key_dyli_p_new")
 
-# Database connection
-def get_db():
-    return psycopg2.connect(DB_URL, sslmode='prefer')
-
-# Check if user is admin
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
-# Start command
-@bot.message_handler(commands=['start'])
-def start(message):
-    welcome = """
-🔐 **ST FAMILY License Bot**
-
-**Available Commands:**
-👤 User Commands:
-/getkey - Get your license key
-/checkkey <key> - Check key status
-/mykeys - View all your keys
-
-🔧 Admin Commands:
-/generate <days> - Generate key
-/genkeys <count> <days> - Generate multiple keys
-/revoke <key> - Revoke a key
-/stats - Server statistics
-/listkeys - List all active keys
-/extend <key> <days> - Extend key expiry
-
-Need help? Contact @STXFAMILY
-"""
-    bot.reply_to(message, welcome, parse_mode='Markdown')
-
-# Get key for user
-@bot.message_handler(commands=['getkey'])
-def get_key(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or "Unknown"
-    
+def get_db_connection():
+    """Get database connection with SSL fallback"""
     try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        # Check if user already has an active key
-        cur.execute("""
-            SELECT license_key, expiry_date FROM licenses 
-            WHERE telegram_id = %s AND status = 'active' AND expiry_date > NOW()
-            ORDER BY created_at DESC LIMIT 1
-        """, (user_id,))
-        
-        existing = cur.fetchone()
-        if existing:
-            expiry = existing['expiry_date'].strftime('%Y-%m-%d %H:%M')
-            bot.reply_to(message, f"✅ You already have an active key:\n\n`{existing['license_key']}`\n\nExpires: {expiry}", parse_mode='Markdown')
-            conn.close()
-            return
-        
-        # Generate new key
-        import secrets
-        key = '-'.join([''.join(secrets.choice('0123456789ABCDEF') for _ in range(4)) for _ in range(4)])
-        expiry = datetime.now() + timedelta(days=30)
-        
-        cur.execute("""
-            INSERT INTO licenses (license_key, key_type, expiry_date, telegram_id, telegram_username, status)
-            VALUES (%s, 'standard', %s, %s, %s, 'active')
-        """, (key, expiry, user_id, username))
-        
-        conn.commit()
-        conn.close()
-        
-        bot.reply_to(message, f"""
-🎉 **Key Generated Successfully!**
-
-`{key}`
-
-📅 Valid until: {expiry.strftime('%Y-%m-%d %H:%M')}
-👤 Bound to your Telegram account
-
-✅ **How to use:**
-1. Open the game
-2. Paste this key when prompted
-3. Enjoy!
-
-⚠️ Keep this key private!
-""", parse_mode='Markdown')
-        
+        conn = psycopg2.connect(DB_URL, sslmode='prefer', connect_timeout=10)
+        conn.autocommit = True
+        return conn
     except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
+        print(f"[DB] Connection attempt 1 failed: {e}")
+        try:
+            conn = psycopg2.connect(DB_URL, connect_timeout=10)
+            conn.autocommit = True
+            return conn
+        except Exception as e2:
+            print(f"[DB] Connection attempt 2 failed: {e2}")
+            conn = psycopg2.connect(DB_URL, sslmode='allow', connect_timeout=10)
+            conn.autocommit = True
+            return conn
 
-# Check key status
-@bot.message_handler(commands=['checkkey'])
-def check_key(message):
+def return_db_connection(conn):
+    """Close database connection"""
     try:
-        key = message.text.split(maxsplit=1)[1].strip()
-    except IndexError:
-        bot.reply_to(message, "Usage: /checkkey <YOUR-KEY-HERE>")
-        return
-    
-    try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        cur.execute("SELECT * FROM licenses WHERE license_key = %s", (key,))
-        row = cur.fetchone()
         conn.close()
-        
-        if not row:
-            bot.reply_to(message, "❌ Key not found")
-            return
-        
-        status = "✅ Active" if row['status'] == 'active' and row['expiry_date'] > datetime.now() else "❌ Inactive/Expired"
-        hwid = row['hwid'] or "Not bound yet"
-        expiry = row['expiry_date'].strftime('%Y-%m-%d %H:%M')
-        
-        info = f"""
-📊 **Key Information**
+    except:
+        pass
 
-Key: `{key}`
-Status: {status}
-Type: {row['key_type']}
-HWID: `{hwid}`
-Expires: {expiry}
-Created: {row['created_at'].strftime('%Y-%m-%d %H:%M')}
-"""
-        bot.reply_to(message, info, parse_mode='Markdown')
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
-
-# My keys
-@bot.message_handler(commands=['mykeys'])
-def my_keys(message):
-    user_id = message.from_user.id
-    
+def init_database():
+    """Initialize database tables and settings"""
+    conn = None
     try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        cur.execute("""
-            SELECT license_key, expiry_date, status FROM licenses 
-            WHERE telegram_id = %s 
-            ORDER BY created_at DESC LIMIT 10
-        """, (user_id,))
-        
-        keys = cur.fetchall()
-        conn.close()
-        
-        if not keys:
-            bot.reply_to(message, "❌ You don't have any keys yet. Use /getkey to get one!")
-            return
-        
-        response = "📋 **Your Keys:**\n\n"
-        for k in keys:
-            status = "✅" if k['status'] == 'active' and k['expiry_date'] > datetime.now() else "❌"
-            expiry = k['expiry_date'].strftime('%Y-%m-%d')
-            response += f"{status} `{k['license_key']}` - Expires: {expiry}\n"
-        
-        bot.reply_to(message, response, parse_mode='Markdown')
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
-
-# Admin: Generate key
-@bot.message_handler(commands=['generate'])
-def admin_generate(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ Admin only command")
-        return
-    
-    try:
-        days = int(message.text.split()[1])
-    except (IndexError, ValueError):
-        bot.reply_to(message, "Usage: /generate <days>")
-        return
-    
-    try:
-        import secrets
-        key = '-'.join([''.join(secrets.choice('0123456789ABCDEF') for _ in range(4)) for _ in range(4)])
-        expiry = datetime.now() + timedelta(days=days)
-        
-        conn = get_db()
+        conn = get_db_connection()
         cur = conn.cursor()
+        
+        # Create licenses table
         cur.execute("""
-            INSERT INTO licenses (license_key, key_type, expiry_date, status)
-            VALUES (%s, 'admin_generated', %s, 'active')
-        """, (key, expiry))
-        conn.commit()
-        conn.close()
-        
-        bot.reply_to(message, f"✅ Generated:\n\n`{key}`\n\nValid for {days} days", parse_mode='Markdown')
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
-
-# Admin: Generate multiple keys
-@bot.message_handler(commands=['genkeys'])
-def admin_gen_keys(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ Admin only command")
-        return
-    
-    try:
-        parts = message.text.split()
-        count = int(parts[1])
-        days = int(parts[2])
-    except (IndexError, ValueError):
-        bot.reply_to(message, "Usage: /genkeys <count> <days>")
-        return
-    
-    if count > 50:
-        bot.reply_to(message, "❌ Maximum 50 keys at once")
-        return
-    
-    try:
-        import secrets
-        conn = get_db()
-        cur = conn.cursor()
-        keys = []
-        expiry = datetime.now() + timedelta(days=days)
-        
-        for _ in range(count):
-            key = '-'.join([''.join(secrets.choice('0123456789ABCDEF') for _ in range(4)) for _ in range(4)])
-            cur.execute("""
-                INSERT INTO licenses (license_key, key_type, expiry_date, status)
-                VALUES (%s, 'bulk_admin', %s, 'active')
-            """, (key, expiry))
-            keys.append(key)
-        
-        conn.commit()
-        conn.close()
-        
-        response = f"✅ Generated {count} keys (Valid for {days} days):\n\n"
-        response += '\n'.join([f"`{k}`" for k in keys])
-        
-        bot.reply_to(message, response, parse_mode='Markdown')
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
-
-# Admin: Revoke key
-@bot.message_handler(commands=['revoke'])
-def admin_revoke(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ Admin only command")
-        return
-    
-    try:
-        key = message.text.split(maxsplit=1)[1].strip()
-    except IndexError:
-        bot.reply_to(message, "Usage: /revoke <key>")
-        return
-    
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("UPDATE licenses SET status = 'revoked' WHERE license_key = %s", (key,))
-        
-        if cur.rowcount > 0:
-            conn.commit()
-            bot.reply_to(message, f"✅ Key revoked: `{key}`", parse_mode='Markdown')
-        else:
-            bot.reply_to(message, "❌ Key not found")
-        
-        conn.close()
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
-
-# Admin: Stats
-@bot.message_handler(commands=['stats'])
-def admin_stats(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ Admin only command")
-        return
-    
-    try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        cur.execute("SELECT COUNT(*) as total FROM licenses")
-        total = cur.fetchone()['total']
-        
-        cur.execute("SELECT COUNT(*) as active FROM licenses WHERE status = 'active' AND expiry_date > NOW()")
-        active = cur.fetchone()['active']
-        
-        cur.execute("SELECT COUNT(*) as expired FROM licenses WHERE expiry_date <= NOW()")
-        expired = cur.fetchone()['expired']
-        
-        cur.execute("SELECT COUNT(DISTINCT telegram_id) as users FROM licenses WHERE telegram_id IS NOT NULL")
-        users = cur.fetchone()['users']
-        
-        conn.close()
-        
-        stats = f"""
-📊 **Server Statistics**
-
-Total Keys: {total}
-Active Keys: {active}
-Expired Keys: {expired}
-Total Users: {users}
-
-🕒 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-"""
-        bot.reply_to(message, stats, parse_mode='Markdown')
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
-
-# Admin: List keys
-@bot.message_handler(commands=['listkeys'])
-def admin_list(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ Admin only command")
-        return
-    
-    try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        cur.execute("""
-            SELECT license_key, telegram_username, expiry_date, status 
-            FROM licenses 
-            WHERE status = 'active' AND expiry_date > NOW()
-            ORDER BY expiry_date DESC LIMIT 20
+            CREATE TABLE IF NOT EXISTS licenses (
+                id SERIAL PRIMARY KEY,
+                license_key VARCHAR(255) UNIQUE NOT NULL,
+                key_type VARCHAR(50) DEFAULT 'standard',
+                hwid VARCHAR(255),
+                expiry_date TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                last_used TIMESTAMP,
+                status VARCHAR(20) DEFAULT 'active',
+                telegram_id BIGINT,
+                telegram_username VARCHAR(255)
+            )
         """)
         
-        keys = cur.fetchall()
-        conn.close()
-        
-        if not keys:
-            bot.reply_to(message, "❌ No active keys")
-            return
-        
-        response = "📋 **Active Keys (Last 20):**\n\n"
-        for k in keys:
-            user = k['telegram_username'] or "Anonymous"
-            expiry = k['expiry_date'].strftime('%Y-%m-%d')
-            response += f"`{k['license_key']}` - @{user} - {expiry}\n"
-        
-        bot.reply_to(message, response, parse_mode='Markdown')
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
-
-# Admin: Extend key
-@bot.message_handler(commands=['extend'])
-def admin_extend(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ Admin only command")
-        return
-    
-    try:
-        parts = message.text.split()
-        key = parts[1]
-        days = int(parts[2])
-    except (IndexError, ValueError):
-        bot.reply_to(message, "Usage: /extend <key> <days>")
-        return
-    
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        
+        # Create server_settings table with correct structure
         cur.execute("""
-            UPDATE licenses 
-            SET expiry_date = expiry_date + INTERVAL '%s days'
-            WHERE license_key = %s
-        """, (days, key))
+            CREATE TABLE IF NOT EXISTS server_settings (
+                key VARCHAR(255) PRIMARY KEY,
+                value VARCHAR(255) NOT NULL
+            )
+        """)
         
-        if cur.rowcount > 0:
-            conn.commit()
-            bot.reply_to(message, f"✅ Extended `{key}` by {days} days", parse_mode='Markdown')
-        else:
-            bot.reply_to(message, "❌ Key not found")
+        # Insert default settings
+        cur.execute("""
+            INSERT INTO server_settings (key, value) VALUES
+                ('server_enabled', '1'),
+                ('key_validation_enabled', '1'),
+                ('key_creation_enabled', '1')
+            ON CONFLICT (key) DO NOTHING
+        """)
         
-        conn.close()
-        
+        print("✅ Database initialized successfully.")
     except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
+        print(f"❌ Database initialization error: {e}")
+    finally:
+        if conn:
+            return_db_connection(conn)
 
-# Start polling
-if __name__ == '__main__':
-    print("🤖 ST FAMILY Bot started!")
-    print(f"Admin ID: {ADMIN_IDS[0]}")
-    bot.infinity_polling()
+# Initialize database on startup
+init_database()
+
+def get_status(conn, key):
+    """Get server setting status"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM server_settings WHERE key = %s LIMIT 1", (key,))
+            row = cur.fetchone()
+        if not row:
+            return True
+        return str(row[0]) == "1"
+    except Exception as e:
+        print(f"[ERROR] get_status: {e}")
+        return True
+
+@app.before_request
+def check_server_enabled():
+    """Check if server is enabled before processing requests"""
+    path = request.path
+    if path in ("/health", "/telegram-webhook", "/"):
+        return None
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not get_status(conn, "server_enabled"):
+            return jsonify({"error": "Server temporarily disabled by admin"}), 503
+    except Exception as e:
+        print(f"[ERROR] check_server_enabled: {e}")
+    finally:
+        if conn:
+            return_db_connection(conn)
+    return None
+
+@app.get("/")
+@app.get("/health")
+def health():
+    """Health check endpoint"""
+    return jsonify({"status": "ok", "service": "ST FAMILY License Server"})
+
+@app.post("/validate")
+def validate_key():
+    """Validate license key"""
+    start_time = time.time()
+    payload = request.get_json(silent=True) or {}
+    key = payload.get("key", "").strip()
+    hwid = payload.get("hwid", "").strip()
+
+    if not key or not hwid:
+        return jsonify({"valid": False, "message": "Invalid request: Missing key or HWID"})
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not get_status(conn, "key_validation_enabled"):
+            return jsonify({"valid": False, "message": "Key validation temporarily disabled"})
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Check if key exists and is valid
+            cur.execute(
+                """
+                SELECT * FROM licenses
+                WHERE license_key = %s
+                  AND expiry_date > NOW()
+                  AND status = 'active'
+                  AND (
+                    key_type LIKE 'global_%'
+                    OR hwid = %s
+                    OR hwid IS NULL
+                  )
+                """,
+                (key, hwid)
+            )
+            row = cur.fetchone()
+
+            if not row:
+                print(f"[VALIDATE] ❌ Key {key} not found or invalid")
+                return jsonify({"valid": False, "message": "Invalid or expired key"})
+
+            # Bind HWID if not bound yet
+            if row['hwid'] is None and not str(row['key_type']).startswith('global_'):
+                cur.execute(
+                    "UPDATE licenses SET hwid = %s WHERE license_key = %s",
+                    (hwid, key)
+                )
+                print(f"[VALIDATE] Bound key {key} to HWID {hwid}")
+
+            # Update last_used
+            cur.execute(
+                "UPDATE licenses SET last_used = NOW() WHERE license_key = %s",
+                (key,)
+            )
+
+            elapsed = time.time() - start_time
+            print(f"[VALIDATE] ✅ Valid key: {key} | HWID: {hwid} | Time: {elapsed:.3f}s")
+
+            return jsonify({
+                "valid": True,
+                "message": "Key activated successfully!",
+                "expiry_date": row['expiry_date'].isoformat() if row['expiry_date'] else None,
+                "key_type": row['key_type']
+            })
+
+    except Exception as e:
+        print(f"[VALIDATE] ❌ Error: {e}")
+        return jsonify({"valid": False, "message": f"Server error: {str(e)}"})
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+@app.get("/generate")
+def generate_keys():
+    """Generate license keys"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not get_status(conn, "key_creation_enabled"):
+            return jsonify({"success": False, "message": "Key creation temporarily disabled"}), 503
+
+        count = int(request.args.get("count", 1))
+        days = int(request.args.get("days", 30))
+        key_type = request.args.get("type", "standard")
+
+        if count > 100:
+            return jsonify({"success": False, "message": "Maximum 100 keys per request"}), 400
+
+        keys = []
+        expiry_date = datetime.now() + timedelta(days=days)
+
+        with conn.cursor() as cur:
+            for _ in range(count):
+                key = '-'.join([''.join(secrets.choice('0123456789ABCDEF') for _ in range(4)) for _ in range(4)])
+                cur.execute(
+                    """
+                    INSERT INTO licenses (license_key, key_type, expiry_date, status)
+                    VALUES (%s, %s, %s, 'active')
+                    """,
+                    (key, key_type, expiry_date)
+                )
+                keys.append({"key": key, "expiry_date": expiry_date.isoformat()})
+
+        print(f"[GENERATE] Created {count} keys, valid for {days} days")
+        return jsonify({"success": True, "message": f"{count} keys generated", "keys": keys})
+
+    except Exception as e:
+        print(f"[GENERATE] ❌ Error: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+@app.delete("/revoke/<key>")
+def revoke_key(key):
+    """Revoke a license key"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE licenses SET status = 'revoked' WHERE license_key = %s", (key,))
+            if cur.rowcount > 0:
+                print(f"[REVOKE] Key revoked: {key}")
+                return jsonify({"success": True, "message": f"Key {key} revoked"})
+            else:
+                return jsonify({"success": False, "message": "Key not found"}), 404
+    except Exception as e:
+        print(f"[REVOKE] ❌ Error: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+@app.get("/stats")
+def get_stats():
+    """Get server statistics"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) as total FROM licenses")
+            total = cur.fetchone()['total']
+
+            cur.execute("SELECT COUNT(*) as active FROM licenses WHERE status = 'active' AND expiry_date > NOW()")
+            active = cur.fetchone()['active']
+
+            cur.execute("SELECT COUNT(*) as expired FROM licenses WHERE expiry_date <= NOW()")
+            expired = cur.fetchone()['expired']
+
+            cur.execute("SELECT COUNT(DISTINCT telegram_id) as users FROM licenses WHERE telegram_id IS NOT NULL")
+            users = cur.fetchone()['users']
+
+        return jsonify({
+            "total_keys": total,
+            "active_keys": active,
+            "expired_keys": expired,
+            "total_users": users
+        })
+    except Exception as e:
+        print(f"[STATS] ❌ Error: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+@app.get("/settings")
+def get_settings():
+    """Get server settings"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        server = get_status(conn, "server_enabled")
+        validation = get_status(conn, "key_validation_enabled")
+        creation = get_status(conn, "key_creation_enabled")
+
+        return jsonify({
+            "server_enabled": server,
+            "key_validation_enabled": validation,
+            "key_creation_enabled": creation
+        })
+    except Exception as e:
+        print(f"[SETTINGS] ❌ Error: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+@app.post("/settings/<key>")
+def update_setting(key):
+    """Update server setting"""
+    conn = None
+    try:
+        if key not in ["server_enabled", "key_validation_enabled", "key_creation_enabled"]:
+            return jsonify({"success": False, "message": "Invalid setting key"}), 400
+
+        new_value = request.json.get("value", "1")
+        conn = get_db_connection()
+
+        with conn.cursor() as cur:
+            cur.execute("UPDATE server_settings SET value = %s WHERE key = %s", (new_value, key))
+
+        print(f"[SETTINGS] Updated {key} = {new_value}")
+        return jsonify({"success": True, "message": f"Setting {key} updated"})
+    except Exception as e:
+        print(f"[SETTINGS] ❌ Error: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+@app.post("/telegram-webhook")
+def telegram_webhook():
+    """Telegram bot webhook endpoint"""
+    try:
+        data = request.get_json()
+        print(f"[TELEGRAM] Webhook received: {data}")
+        return jsonify({"ok": True})
+    except Exception as e:
+        print(f"[TELEGRAM] ❌ Error: {e}")
+        return jsonify({"ok": False}), 500
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
