@@ -5,9 +5,9 @@ import psycopg2.extras
 from datetime import datetime, timedelta
 
 # Configuration
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Get from @BotFather
+BOT_TOKEN = "8216359066:AAEt2GFGgTBp3hh_znnJagH3h1nN5A_XQf0"
 DB_URL = "postgresql://key_dyli_p_new_user:ZzG0MiuxZ4TN04IP22Ae7g750eCgLxAp@dpg-d658hpe3jp1c73ajnb3g-a.oregon-postgres.render.com/key_dyli_p_new"
-ADMIN_IDS = [123456789]  # Replace with your Telegram user ID
+ADMIN_IDS = [7210704553]  # Your admin ID
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -392,5 +392,6 @@ def admin_extend(message):
 
 # Start polling
 if __name__ == '__main__':
-    print("🤖 Bot started successfully!")
+    print("🤖 ST FAMILY Bot started!")
+    print(f"Admin ID: {ADMIN_IDS[0]}")
     bot.infinity_polling()
