@@ -35,45 +35,32 @@ GLOBAL_KEY_REGEX = re.compile(r"^GLB-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}$", re.I
 
 
 def get_db_connection():
-    global db_pool
-    if db_pool is None:
-        try:
-            db_pool = psycopg2.pool.SimpleConnectionPool(
-                1, 10,  # min=1, max=10 connections
-                DB_URL,
-                sslmode='require',
-                connect_timeout=5
-            )
-        except psycopg2.OperationalError:
-            db_pool = psycopg2.pool.SimpleConnectionPool(
-                1, 10,
-                DB_URL,
-                connect_timeout=5
-            )
-    
+    """Get database connection with SSL fallback"""
     try:
-        conn = db_pool.getconn()
+        # Try with prefer SSL (most compatible)
+        conn = psycopg2.connect(DB_URL, sslmode='prefer', connect_timeout=10)
         conn.autocommit = True
         return conn
-    except:
-        # Fallback to direct connection
+    except Exception as e:
+        print(f"[DB] Connection attempt 1 failed: {e}")
         try:
-            conn = psycopg2.connect(DB_URL, sslmode='require', connect_timeout=5)
-        except psycopg2.OperationalError:
-            conn = psycopg2.connect(DB_URL, connect_timeout=5)
-        conn.autocommit = True
-        return conn
+            # Try without SSL
+            conn = psycopg2.connect(DB_URL, connect_timeout=10)
+            conn.autocommit = True
+            return conn
+        except Exception as e2:
+            print(f"[DB] Connection attempt 2 failed: {e2}")
+            # Try with allow SSL
+            conn = psycopg2.connect(DB_URL, sslmode='allow', connect_timeout=10)
+            conn.autocommit = True
+            return conn
 
 def return_db_connection(conn):
-    """Return connection to pool"""
-    global db_pool
-    if db_pool:
-        try:
-            db_pool.putconn(conn)
-            return
-        except:
-            pass
-    conn.close()
+    """Close database connection"""
+    try:
+        conn.close()
+    except:
+        pass
 
 
 def get_status(conn, key):
